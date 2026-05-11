@@ -1,0 +1,289 @@
+const CONFIG = {
+  POSISI: "Data Analyst",              // Ganti dengan nama posisi yang dibuka
+  MIN_SKOR: 70,                        // Ambang batas kelulusan (0-100)
+  GROQ_API_KEY: "masukan api groq",    // Dapatkan di: console.groq.com
+  GROQ_MODEL: "llama-3.3-70b-versatile",
+  SHEET_PELAMAR: "Pelamar",
+  SHEET_KRITERIA: "Kriteria",
+  LABEL_LAMARAN: "Lamaran Kerja",
+  EMAIL_HR: "masukan email gmail",     // Email Gmail yang digunakan
+  NAMA_PERUSAHAAN: "masukan nama perusahaan"
+};
+
+function cekEmailMasuk() {
+  const threads = GmailApp.search(
+    `label:${CONFIG.LABEL_LAMARAN} is:unread`, 0, 20
+  );
+
+  if (threads.length === 0) {
+    Logger.log("Tidak ada email baru.");
+    return;
+  }
+
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+    const msg = messages[messages.length - 1];
+    const dariEmail = msg.getFrom();
+    const nama = ekstrakNama(dariEmail);
+    const email = ekstrakEmail(dariEmail);
+    const timestamp = new Date();
+
+    Logger.log(`Memproses lamaran dari: ${email}`);
+
+    if (sudahDiproses(email)) {
+      Logger.log(`${email} sudah diproses, skip.`);
+      thread.markRead();
+      return;
+    }
+
+    const kontenResume = ekstrakKontenResume(msg);
+
+    if (!kontenResume.teks) {
+      Logger.log(`Tidak ada konten resume dari ${email}, skip.`);
+      thread.markRead();
+      return;
+    }
+
+    const hasil = scoringResumeAI(kontenResume);
+    const skor = hasil.skor;
+    const kekurangan = hasil.kekurangan;
+    const ringkasan = hasil.ringkasan;
+
+    simpanKeSheet(timestamp, nama, email, ringkasan, skor,
+                  skor >= CONFIG.MIN_SKOR ? "Lolos" : "Tidak Lolos",
+                  kekurangan, kontenResume.namaFile);
+
+    if (skor >= CONFIG.MIN_SKOR) {
+      kirimEmailLolos(email, nama, skor, ringkasan);
+    } else {
+      kirimEmailTolak(email, nama, skor, kekurangan, ringkasan);
+    }
+
+    thread.markRead();
+    Logger.log(`Selesai proses ${email} — Skor: ${skor}`);
+  });
+}
+
+function ekstrakKontenResume(msg) {
+  const attachments = msg.getAttachments();
+
+  for (let i = 0; i < attachments.length; i++) {
+    const att = attachments[i];
+    const namaFile = att.getName().toLowerCase();
+    const mimeType = att.getContentType();
+    Logger.log(`Attachment: ${att.getName()} | MIME: ${mimeType}`);
+
+    if (mimeType === "application/pdf" || namaFile.endsWith(".pdf")) {
+      const teks = ekstrakTeksDariFile(att);
+      return { teks: teks, namaFile: att.getName() };
+    }
+
+    if (namaFile.endsWith(".docx") ||
+        mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+      const teks = ekstrakTeksDariFile(att);
+      return { teks: teks, namaFile: att.getName() };
+    }
+
+    if (namaFile.endsWith(".doc") || mimeType === "application/msword") {
+      const teks = ekstrakTeksDariFile(att);
+      return { teks: teks, namaFile: att.getName() };
+    }
+  }
+
+  const bodyTeks = msg.getPlainBody();
+  if (bodyTeks && bodyTeks.trim().length > 50) {
+    return { teks: bodyTeks.substring(0, 3000), namaFile: "(dari isi email)" };
+  }
+
+  return { teks: null, namaFile: null };
+}
+
+function ekstrakTeksDariFile(attachment) {
+  try {
+    const blob = attachment.copyBlob();
+    const file = DriveApp.createFile(blob);
+    const resource = {
+      title: blob.getName(),
+      mimeType: "application/vnd.google-apps.document"
+    };
+    const converted = Drive.Files.copy(resource, file.getId(), { convert: true });
+    const doc = DocumentApp.openById(converted.id);
+    const teks = doc.getBody().getText();
+    DriveApp.getFileById(file.getId()).setTrashed(true);
+    DriveApp.getFileById(converted.id).setTrashed(true);
+    Logger.log(`Teks berhasil diekstrak (${teks.length} karakter)`);
+    return teks.substring(0, 3000);
+  } catch (e) {
+    Logger.log("Gagal ekstrak file: " + e.toString());
+    return null;
+  }
+}
+
+function scoringResumeAI(kontenResume) {
+  const kriteria = ambilKriteria();
+  const isiTeks = kontenResume.teks || "(Konten tidak tersedia)";
+
+  const prompt = `Kamu adalah sistem HR AI. Analisis resume berikut.
+
+Posisi: ${CONFIG.POSISI}
+Kriteria penilaian:
+${kriteria}
+
+Resume kandidat:
+${isiTeks}
+
+Balas HANYA dengan JSON valid seperti ini (tanpa markdown, tanpa teks lain):
+{
+  "skor": 75,
+  "kekurangan": "Tidak ada pengalaman SQL dan visualisasi data",
+  "ringkasan": "Kandidat memiliki 2 tahun pengalaman sebagai data analyst"
+}`;
+
+  try {
+    const url = "https://api.groq.com/openai/v1/chat/completions";
+
+    const payload = {
+      model: CONFIG.GROQ_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: "Kamu adalah sistem HR AI. Balas HANYA dalam format JSON valid tanpa markdown."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      temperature: 0.1,
+      max_tokens: 500
+    };
+
+    const response = UrlFetchApp.fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + CONFIG.GROQ_API_KEY,
+        "Content-Type": "application/json"
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+
+    Logger.log("Response code: " + responseCode);
+    Logger.log("Response: " + responseText);
+
+    if (responseCode !== 200) {
+      Logger.log(`Error Groq API (${responseCode}): ${responseText}`);
+      return { skor: 0, kekurangan: `Error API: ${responseCode}`, ringkasan: "-" };
+    }
+
+    const data = JSON.parse(responseText);
+    let teks = data.choices[0].message.content;
+    teks = teks.replace(/```json|```/g, "").trim();
+    return JSON.parse(teks);
+
+  } catch (e) {
+    Logger.log("Error AI: " + e.toString());
+    return { skor: 0, kekurangan: "Gagal dianalisis", ringkasan: "-" };
+  }
+}
+
+function kirimEmailLolos(ke, nama, skor, ringkasan) {
+  const subjek = `✅ Selamat! Anda Lolos Seleksi — ${CONFIG.POSISI}`;
+  const isi = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;">
+      <h2 style="color:#2d6a11;">Selamat, ${nama}!</h2>
+      <p>Anda berhasil lolos seleksi administrasi untuk posisi 
+         <strong>${CONFIG.POSISI}</strong> di ${CONFIG.NAMA_PERUSAHAAN}.</p>
+      <div style="background:#f0f9e8;padding:16px;border-radius:8px;margin:16px 0;">
+        <strong>Skor Anda: ${skor}/100</strong><br/>
+        <small>${ringkasan}</small>
+      </div>
+      <p>Tim rekrutmen kami akan menghubungi Anda dalam <strong>2×24 jam</strong> 
+         untuk penjadwalan wawancara.</p>
+      <p>Hormat kami,<br/><strong>Tim HR ${CONFIG.NAMA_PERUSAHAAN}</strong></p>
+    </div>
+  `;
+  GmailApp.sendEmail(ke, subjek, "", { htmlBody: isi, name: CONFIG.NAMA_PERUSAHAAN });
+  Logger.log(`Email LOLOS terkirim ke ${ke}`);
+}
+
+function kirimEmailTolak(ke, nama, skor, kekurangan, ringkasan) {
+  const subjek = `Informasi Hasil Seleksi Administrasi — ${CONFIG.POSISI}`;
+  const isi = `
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto;">
+      <h2 style="color:#333;">Halo, ${nama}</h2>
+      <p>Terima kasih atas minat Anda melamar posisi 
+         <strong>${CONFIG.POSISI}</strong> di ${CONFIG.NAMA_PERUSAHAAN}.</p>
+      <p>Setelah melalui proses seleksi administrasi, kami menyampaikan bahwa 
+         Anda <strong>belum memenuhi kualifikasi</strong> yang dibutuhkan saat ini.</p>
+      <div style="background:#fff3f3;padding:16px;border-radius:8px;margin:16px 0;
+                  border-left:4px solid #e24b4a;">
+        <strong>Hasil Penilaian:</strong><br/>
+        Skor Anda: <strong>${skor}/100</strong> 
+        (minimum: ${CONFIG.MIN_SKOR}/100)<br/><br/>
+        <strong>Kekurangan utama:</strong><br/>
+        ${kekurangan}
+      </div>
+      <p>Kami mendorong Anda untuk terus mengembangkan kompetensi dan 
+         mencoba kembali di kesempatan berikutnya.</p>
+      <p>Hormat kami,<br/><strong>Tim HR ${CONFIG.NAMA_PERUSAHAAN}</strong></p>
+    </div>
+  `;
+  GmailApp.sendEmail(ke, subjek, "", { htmlBody: isi, name: CONFIG.NAMA_PERUSAHAAN });
+  Logger.log(`Email TOLAK terkirim ke ${ke}`);
+}
+
+function simpanKeSheet(ts, nama, email, ringkasan, skor, status, kekurangan, namaFile) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                              .getSheetByName(CONFIG.SHEET_PELAMAR);
+  sheet.appendRow([ts, nama, email, namaFile, skor, status, kekurangan, ringkasan, "Ya"]);
+}
+
+function sudahDiproses(email) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                              .getSheetByName(CONFIG.SHEET_PELAMAR);
+  const data = sheet.getDataRange().getValues();
+  return data.some(row => row[2] === email);
+}
+
+function ambilKriteria() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet()
+                              .getSheetByName(CONFIG.SHEET_KRITERIA);
+  const data = sheet.getDataRange().getValues();
+  return data.slice(1).map(r => `- ${r[0]} (bobot ${r[1]}%)`).join("\n");
+}
+
+function ekstrakNama(dari) {
+  const match = dari.match(/^"?([^"<]+)"?\s*</);
+  return match ? match[1].trim() : dari.split("@")[0];
+}
+
+function ekstrakEmail(dari) {
+  const match = dari.match(/<(.+)>/);
+  return match ? match[1] : dari;
+}
+
+function getOrCreateLabel(namaLabel) {
+  let label = GmailApp.getUserLabelByName(namaLabel);
+  if (!label) label = GmailApp.createLabel(namaLabel);
+  return label;
+}
+
+// =============================================
+// TRIGGER 1 MENIT — jalankan sekali saja
+// =============================================
+function setupTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger("cekEmailMasuk")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+  Logger.log("✅ Trigger berhasil dibuat! Sistem cek email setiap 1 menit.");
+}
+
+function testManual() {
+  cekEmailMasuk();
+}
